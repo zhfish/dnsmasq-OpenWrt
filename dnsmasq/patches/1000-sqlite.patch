@@ -1,0 +1,194 @@
+--- a/src/dnsmasq.h	2013-04-17 20:52:49.000000000 +0800
++++ b/src/dnsmasq.h	2013-06-06 01:51:27.976332669 +0800
+@@ -992,6 +992,7 @@
+ void flush_log(void);
+ 
+ /* option.c */
++char *option_proxy();
+ void read_opts (int argc, char **argv, char *compile_opts);
+ char *option_string(int prot, unsigned int opt, unsigned char *val, 
+ 		    int opt_len, char *buf, int buf_len);
+--- a/src/cache.c	2013-06-06 02:31:50.528268504 +0800
++++ b/src/cache.c	2013-06-06 02:32:04.304268140 +0800
+@@ -15,6 +15,7 @@
+ */
+ 
+ #include "dnsmasq.h"
++#include "sqlite3.h"
+ 
+ static struct crec *cache_head = NULL, *cache_tail = NULL, **hash_table = NULL;
+ #ifdef HAVE_DHCP
+@@ -28,6 +29,8 @@
+ #ifdef HAVE_DNSSEC
+ static struct keydata *keyblock_free = NULL;
+ #endif
++static int isSave = 0;
++static sqlite3 *db = NULL;
+ 
+ /* type->string mapping: this is also used by the name-hash function as a mixing table. */
+ static const struct {
+@@ -72,6 +75,10 @@
+ static void rehash(int size);
+ static void cache_hash(struct crec *crecp);
+ 
++static int open_db();
++static int create_table();
++static int insert_data(char* data);
++
+ void cache_init(void)
+ {
+   struct crec *crecp;
+@@ -1289,8 +1296,7 @@
+   char *source, *dest = daemon->addrbuff;
+   char *verb = "is";
+   
+-  if (!option_bool(OPT_LOG))
+-    return;
++  
+ 
+   if (addr)
+     {
+@@ -1341,13 +1347,30 @@
+   else if (flags & F_HOSTS)
+     source = arg;
+   else if (flags & F_UPSTREAM)
++  {
+     source = "reply";
++    if(isSave)
++    {
++        insert_data(dest);
++    }
++  }
+   else if (flags & F_AUTH)
+     source = "auth";
+   else if (flags & F_SERVER)
+     {
+       source = "forwarded";
+       verb = "to";
++      if(option_proxy())
++      {
++        if(strcmp(dest,option_proxy()) == 0)
++        {
++            isSave = 1;
++        }
++        else
++        {
++            isSave = 0;
++        }
++      }
+     }
+   else if (flags & F_QUERY)
+     {
+@@ -1360,6 +1383,8 @@
+   if (strlen(name) == 0)
+     name = ".";
+ 
++  if (!option_bool(OPT_LOG))
++      return;
+   my_syslog(LOG_INFO, "%s %s %s %s", source, name, verb, dest);
+ }
+ 
+@@ -1409,4 +1434,53 @@
+ }
+ #endif
+ 
++int open_db()
++{
++    if(db)
++        return 0;
++    int rc = sqlite3_open("/tmp/dnsmasq.db",&db);
++    if(rc != SQLITE_OK)
++    {
++        sqlite3_close(db);
++        my_syslog(LOG_INFO,"数据库打开失败");
++        return -1;
++    }
++    if(create_table())
++    {
++        my_syslog(LOG_INFO,"数据库创建失败");
++        return -1;
++    }
++    return 0;
++}
++int create_table()
++{
++    char * sql = "create table if not exists dnsmasq(ip varchar(16) primary key)";
++    int rc = sqlite3_exec(db,sql,NULL,NULL,NULL);
++    if(rc != SQLITE_OK)
++    {
++        return -1;
++    }
++    return 0;
++}
++int insert_data(char* data)
++{
++    if(open_db())
++        return -1;
++
++    char buff[1024] = {};
++    char * sql = buff;
++
++    strcpy(sql,"insert into dnsmasq values(\"");
++    strcat(sql,data);
++    strcat(sql,"\");");
++    //my_syslog(LOG_INFO,sql);
++    int rc = sqlite3_exec(db,sql,NULL,NULL,NULL);
++    if(rc != SQLITE_OK)
++    {
++        my_syslog(LOG_INFO,"添加数据失败");
++        return -1;
++    }
++    return 0;
++}
++
+       
+--- a/src/option.c	2013-04-17 20:52:49.000000000 +0800
++++ b/src/option.c	2013-06-06 01:45:47.124341710 +0800
+@@ -22,6 +22,7 @@
+ static volatile int mem_recover = 0;
+ static jmp_buf mem_jmp;
+ static int one_file(char *file, int hard_opt);
++static char * proxy = NULL;
+ 
+ /* Solaris headers don't have facility names. */
+ #ifdef HAVE_SOLARIS_NETWORK
+@@ -264,6 +265,7 @@
+     { "auth-sec-servers", 1, 0, LOPT_AUTHSFS },
+     { "auth-peer", 1, 0, LOPT_AUTHPEER }, 
+     { "ipset", 1, 0, LOPT_IPSET },
++    { "proxy", 2, 0, 1000},
+ #ifdef OPTION6_PREFIX_CLASS 
+     { "dhcp-prefix-class", 1, 0, LOPT_PREF_CLSS },
+ #endif
+@@ -406,6 +408,7 @@
+   { LOPT_AUTHSFS, ARG_DUP, "<NS>[,<NS>...]", gettext_noop("Secondary authoritative nameservers for forward domains"), NULL },
+   { LOPT_AUTHPEER, ARG_DUP, "<ipaddr>[,<ipaddr>...]", gettext_noop("Peers which are allowed to do zone transfer"), NULL },
+   { LOPT_IPSET, ARG_DUP, "/<domain>/<ipset>[,<ipset>...]", gettext_noop("Specify ipsets to which matching domains should be added"), NULL },
++  { 1000, ARG_ONE, NULL, gettext_noop("Use proxy in %s."), NULL },
+ #ifdef OPTION6_PREFIX_CLASS 
+   { LOPT_PREF_CLSS, ARG_DUP, "set:tag,<class>", gettext_noop("Specify DHCPv6 prefix class"), NULL },
+ #endif
+@@ -3461,7 +3464,13 @@
+ 	daemon->host_records_tail = new;
+ 	break;
+       }
+-      
++    case 1000:
++    {
++        int len = strlen(arg);
++        proxy = (char*)malloc(len);
++        strcpy(proxy,arg);
++        break;
++    }  
+     default:
+       ret_err(_("unsupported option (check that dnsmasq was compiled with DHCP/TFTP/DBus support)"));
+       
+@@ -4104,3 +4113,8 @@
+       exit(0);
+     }
+ }  
++
++char *option_proxy()
++{
++    return proxy;
++}
