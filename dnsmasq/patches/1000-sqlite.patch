@@ -88,7 +88,7 @@
    my_syslog(LOG_INFO, "%s %s %s %s", source, name, verb, dest);
  }
  
-@@ -1409,4 +1434,53 @@
+@@ -1409,4 +1434,61 @@
  }
  #endif
  
@@ -133,14 +133,22 @@
 +    strcat(sql,"\");");
 +    //my_syslog(LOG_INFO,sql);
 +    int rc = sqlite3_exec(db,sql,NULL,NULL,NULL);
-+    if(rc != SQLITE_OK)
++    if(rc == SQLITE_OK)
 +    {
-+        my_syslog(LOG_INFO,"添加数据失败");
-+        return -1;
++        my_syslog(LOG_INFO,"添加数据成功");
++	 strcpy(sql,"route add -host ");
++	 strcat(sql,data);
++	 strcat(sql," gw 192.168.215.2");
++	 system(sql);
++        return 0;
++    }
++    else
++    {
++	 //my_syslog(LOG_INFO,"添加数据失败");
++	 return -1;
 +    }
 +    return 0;
 +}
-+
        
 --- a/src/option.c	2013-04-17 20:52:49.000000000 +0800
 +++ b/src/option.c	2013-06-06 01:45:47.124341710 +0800
